@@ -54,8 +54,8 @@
 
     <string name="action_screen_on">Screen On</string>
     <string name="action_screen_off">Screen Off</string>
-    <string name="msg_screen_on_enabled">Screen will stay on</string>
-    <string name="msg_screen_on_disabled">Screen timeout restored</string>
+    <string name="msg_screen_on_enabled">屏幕常亮已开启，不会自动息屏</string>
+    <string name="msg_screen_on_disabled">已恢复自动息屏</string>
 
     <string name="msg_enabling_terminal_toolbar">Enabling Terminal Toolbar</string>
     <string name="msg_disabling_terminal_toolbar">Disabling Terminal Toolbar</string>
