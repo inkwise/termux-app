@@ -843,10 +843,8 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
             int iconHeight = lockView.getHeight();
             if (width <= 0 || height <= 0 || iconWidth <= 0 || iconHeight <= 0) return;
 
-            float density = getResources().getDisplayMetrics().density;
-            float radius = Math.min(width, height) / 2f - Math.max(iconWidth, iconHeight) / 2f
-                - Math.round(16 * density);
-            if (radius < 0) radius = 0;
+            // The circle is centered on the screen and has a diameter of half the screen width.
+            float radius = width / 4f;
 
             float angle = (float) animation.getAnimatedValue();
             float centerX = width / 2f;
