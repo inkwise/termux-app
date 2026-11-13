@@ -1,16 +1,20 @@
 name: Release Build
 
-# Builds the Termux app release variant (minified, unsigned by Gradle), then
-# signs the universal APK with a stable release keystore and publishes it.
+# Builds the Termux app release variant (minified, unsigned by Gradle), signs
+# the arm64-v8a APK and publishes it.
+#
+# By default the APK is signed with the public "untrusted" test key that ships
+# in this repository (app/testkey_untrusted.jks). The official Termux GitHub
+# release APKs (e.g. v0.118.3 "github-debug" builds) are signed with the very
+# same key, so builds from this workflow share their signature.
 #
 # Trigger:
 #   - Manually from the Actions tab (workflow_dispatch)
 #   - Pushing a tag matching v<semver>, e.g. v0.119.0
 #
-# Optional repository secrets (Settings -> Secrets and variables -> Actions):
-#   RELEASE_KEYSTORE_BASE64    base64 of a JKS keystore. If set, it is used for
-#                              signing; otherwise a keystore is generated once
-#                              and kept in the Actions cache.
+# Optional repository secrets (Settings -> Secrets and variables -> Actions),
+# used instead of the test key when set:
+#   RELEASE_KEYSTORE_BASE64    base64 of a JKS keystore
 #   RELEASE_KEYSTORE_PASSWORD  password of the keystore (required with the above)
 #   RELEASE_KEY_ALIAS          key alias inside the keystore (default: termux)
 #   RELEASE_KEY_PASSWORD       key password (default: same as store password)
@@ -37,6 +41,11 @@ on:
         description: 'Optional app versionName override (valid semver, e.g. 0.119.0-beta.3)'
         type: string
         required: false
+      version_code:
+        description: 'Optional app versionCode override (default: 1003, higher than official 0.118.3 = 1002, so official GitHub builds can be updated in place)'
+        type: string
+        required: false
+        default: '1003'
   push:
     tags:
       - 'v[0-9]*'
@@ -100,6 +109,7 @@ jobs:
           INPUT_CREATE_RELEASE: ${{ inputs.create_release }}
           INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
           INPUT_VERSION_NAME: ${{ inputs.version_name }}
+          INPUT_VERSION_CODE: ${{ inputs.version_code }}
         run: |
           set -euo pipefail
 
@@ -107,6 +117,7 @@ jobs:
           CREATE_RELEASE="${INPUT_CREATE_RELEASE:-true}"
           RELEASE_TAG_INPUT="${INPUT_RELEASE_TAG:-}"
           VERSION_NAME_INPUT="${INPUT_VERSION_NAME:-}"
+          VERSION_CODE_INPUT="${INPUT_VERSION_CODE:-}"
 
           CURRENT_VERSION_NAME_REGEX='\s+versionName "([^"]+)"$'
           CURRENT_VERSION_NAME="$(grep -m 1 -E "$CURRENT_VERSION_NAME_REGEX" ./app/build.gradle | sed -r "s/$CURRENT_VERSION_NAME_REGEX/\1/")"
@@ -116,6 +127,16 @@ jobs:
           if ! printf "%s" "$VERSION_SEMVER" | grep -qP '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$'; then
             echo "The versionName '$VERSION_SEMVER' is not a valid version as per semantic version '2.0.0' spec."
             exit 1
+          fi
+
+          if [ -n "$VERSION_CODE_INPUT" ]; then
+            if ! printf "%s" "$VERSION_CODE_INPUT" | grep -qP '^[0-9]+$'; then
+              echo "version_code '$VERSION_CODE_INPUT' must be a positive integer"
+              exit 1
+            fi
+            sed -i -E "s/versionCode [0-9]+/versionCode $VERSION_CODE_INPUT/" app/build.gradle
+            grep -qE "versionCode $VERSION_CODE_INPUT" app/build.gradle || { echo "Failed to set versionCode"; exit 1; }
+            echo "Using versionCode $VERSION_CODE_INPUT"
           fi
 
           RELEASE_TAG="${RELEASE_TAG_INPUT:-$RELEASE_VERSION_NAME}"
@@ -151,12 +172,6 @@ jobs:
           restore-keys: |
             termux-bootstrap-${{ env.PACKAGE_VARIANT }}-
 
-      - name: Cache release signing keystore
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}/termux-release-keystore
-          key: termux-release-keystore-${{ github.repository }}
-
       - name: Prepare signing keystore
         shell: bash
         env:
@@ -168,7 +183,6 @@ jobs:
           set -euo pipefail
           KS_DIR="${RUNNER_TEMP}/termux-release-keystore"
           KEYSTORE="$KS_DIR/release.jks"
-          PWFILE="$KS_DIR/passwd"
           mkdir -p "$KS_DIR"
 
           if [ -n "${RELEASE_KEYSTORE_B64:-}" ]; then
@@ -177,22 +191,15 @@ jobs:
             KS_ALIAS="${RELEASE_KEY_ALIAS:-termux}"
             KEY_PASS="${RELEASE_KEY_PASSWORD:-$KS_PASS}"
             echo "Using release keystore provided via repository secret"
-          elif [ -f "$KEYSTORE" ] && [ -f "$PWFILE" ]; then
-            KS_PASS="$(cat "$PWFILE")"
-            KS_ALIAS="${RELEASE_KEY_ALIAS:-termux}"
-            KEY_PASS="${RELEASE_KEY_PASSWORD:-$KS_PASS}"
-            echo "Restored release keystore from Actions cache"
           else
-            KS_PASS="$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-32)"
-            KS_ALIAS="termux"
-            KEY_PASS="$KS_PASS"
-            keytool -genkeypair \
-              -keystore "$KEYSTORE" -storetype JKS -alias "$KS_ALIAS" \
-              -keyalg RSA -keysize 4096 -validity 10000 \
-              -storepass "$KS_PASS" -keypass "$KS_PASS" \
-              -dname "CN=Termux Release, OU=Termux Fork, O=inkwise, L=Unknown, ST=Unknown, C=Unknown"
-            echo "$KS_PASS" > "$PWFILE"
-            echo "Generated a new release signing keystore (cached for future builds)"
+            # The official Termux GitHub release APKs are signed with the public
+            # "untrusted" test key that ships in this repository. Signing with it
+            # makes this APK signature-compatible with those official builds.
+            KEYSTORE="app/testkey_untrusted.jks"
+            KS_PASS="xrj45yWGLbsO7W0v"
+            KS_ALIAS="alias"
+            KEY_PASS="xrj45yWGLbsO7W0v"
+            echo "Using the Termux test key from the repository (same signature as official GitHub release APKs)"
           fi
 
           {
@@ -283,7 +290,9 @@ jobs:
             commit ${{ github.sha }}.
 
             - Package variant: `${{ env.PACKAGE_VARIANT }}`
-            - ABI: `arm64-v8a` (ARMv8) only, signed with the fork's release keystore
+            - ABI: `arm64-v8a` (ARMv8) only
+            - Signature: Termux test key (`app/testkey_untrusted.jks`), the same
+              key used for the official Termux GitHub release APKs
             - Base app version: `${{ env.RELEASE_VERSION_NAME }}` (see the bundled
               `_sha256sums` file to verify the download)
           files: |
