@@ -33,6 +33,10 @@ on:
         description: 'Release tag to create (default: v<versionName>+<commit>)'
         type: string
         required: false
+      version_name:
+        description: 'Optional app versionName override (valid semver, e.g. 0.119.0-beta.3)'
+        type: string
+        required: false
   push:
     tags:
       - 'v[0-9]*'
@@ -95,16 +99,19 @@ jobs:
           INPUT_PACKAGE_VARIANT: ${{ inputs.package_variant }}
           INPUT_CREATE_RELEASE: ${{ inputs.create_release }}
           INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_VERSION_NAME: ${{ inputs.version_name }}
         run: |
           set -euo pipefail
 
           PACKAGE_VARIANT="${INPUT_PACKAGE_VARIANT:-apt-android-7}"
           CREATE_RELEASE="${INPUT_CREATE_RELEASE:-true}"
           RELEASE_TAG_INPUT="${INPUT_RELEASE_TAG:-}"
+          VERSION_NAME_INPUT="${INPUT_VERSION_NAME:-}"
 
           CURRENT_VERSION_NAME_REGEX='\s+versionName "([^"]+)"$'
           CURRENT_VERSION_NAME="$(grep -m 1 -E "$CURRENT_VERSION_NAME_REGEX" ./app/build.gradle | sed -r "s/$CURRENT_VERSION_NAME_REGEX/\1/")"
-          RELEASE_VERSION_NAME="v$CURRENT_VERSION_NAME+${GITHUB_SHA:0:7}"
+          BASE_VERSION_NAME="${VERSION_NAME_INPUT:-$CURRENT_VERSION_NAME}"
+          RELEASE_VERSION_NAME="v$BASE_VERSION_NAME+${GITHUB_SHA:0:7}"
           VERSION_SEMVER="${RELEASE_VERSION_NAME/v/}"
           if ! printf "%s" "$VERSION_SEMVER" | grep -qP '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$'; then
             echo "The versionName '$VERSION_SEMVER' is not a valid version as per semantic version '2.0.0' spec."
@@ -123,6 +130,7 @@ jobs:
             echo "TERMUX_APP_VERSION_NAME=$VERSION_SEMVER"
             echo "TERMUX_APK_VERSION_TAG=$APK_VERSION_TAG"
             echo "TERMUX_PACKAGE_VARIANT=$PACKAGE_VARIANT"
+            echo "TERMUX_SPLIT_APKS_FOR_RELEASE_BUILDS=1"
           } >> "$GITHUB_ENV"
 
       - name: Cache Gradle
@@ -218,22 +226,17 @@ jobs:
           set -euo pipefail
           OUT_DIR="app/build/outputs/apk/release"
           APK=""
-          for f in "$OUT_DIR"/*.apk; do
+          for f in "$OUT_DIR"/termux-app_*_arm64-v8a*.apk; do
             [ -e "$f" ] || continue
-            if [ -n "$APK" ]; then
-              echo "Unexpected: multiple release APKs found in $OUT_DIR"
-              ls -l "$OUT_DIR"
-              exit 1
-            fi
             APK="$f"
           done
           if [ -z "$APK" ]; then
-            echo "No release APK found in $OUT_DIR"
+            echo "No arm64-v8a release APK found in $OUT_DIR"
             ls -l "$OUT_DIR" 2>/dev/null || true
             exit 1
           fi
 
-          BASE_NAME="termux-app_${APK_VERSION_TAG}_universal"
+          BASE_NAME="termux-app_${APK_VERSION_TAG}_arm64-v8a"
           ALIGNED="$OUT_DIR/${BASE_NAME}.aligned.apk"
           SIGNED="$OUT_DIR/${BASE_NAME}.apk"
           ZIPALIGN="${BUILD_TOOLS_DIR}/zipalign"
@@ -259,9 +262,9 @@ jobs:
       - name: Upload release APK artifact
         uses: actions/upload-artifact@v6
         with:
-          name: termux-app_${{ env.APK_VERSION_TAG }}
+          name: termux-app_${{ env.APK_VERSION_TAG }}_arm64-v8a
           path: |
-            app/build/outputs/apk/release/termux-app_*_universal.apk
+            app/build/outputs/apk/release/termux-app_*_arm64-v8a.apk
             app/build/outputs/apk/release/termux-app_*_sha256sums
           if-no-files-found: error
 
@@ -280,7 +283,7 @@ jobs:
             commit ${{ github.sha }}.
 
             - Package variant: `${{ env.PACKAGE_VARIANT }}`
-            - Output: universal (all ABIs), signed with the fork's release keystore
+            - ABI: `arm64-v8a` (ARMv8) only, signed with the fork's release keystore
             - Base app version: `${{ env.RELEASE_VERSION_NAME }}` (see the bundled
               `_sha256sums` file to verify the download)
           files: |
