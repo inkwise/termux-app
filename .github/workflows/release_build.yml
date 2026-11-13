@@ -1,0 +1,276 @@
+name: Release Build
+
+# Builds the Termux app release variant (minified, unsigned by Gradle), then
+# signs the universal APK with a stable release keystore and publishes it.
+#
+# Trigger:
+#   - Manually from the Actions tab (workflow_dispatch)
+#   - Pushing a tag matching v<semver>, e.g. v0.119.0
+#
+# Optional repository secrets (Settings -> Secrets and variables -> Actions):
+#   RELEASE_KEYSTORE_BASE64    base64 of a JKS keystore. If set, it is used for
+#                              signing; otherwise a keystore is generated once
+#                              and kept in the Actions cache.
+#   RELEASE_KEYSTORE_PASSWORD  password of the keystore (required with the above)
+#   RELEASE_KEY_ALIAS          key alias inside the keystore (default: termux)
+#   RELEASE_KEY_PASSWORD       key password (default: same as store password)
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_variant:
+        description: 'Bootstrap package variant bundled into the APK'
+        type: choice
+        options:
+          - apt-android-7
+          - apt-android-5
+        default: apt-android-7
+      create_release:
+        description: 'Create a GitHub release and attach the signed APK'
+        type: boolean
+        default: true
+      release_tag:
+        description: 'Release tag to create (default: v<versionName>+<commit>)'
+        type: string
+        required: false
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    name: Build release APK (${{ inputs.package_variant || 'apt-android-7' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$SDK_ROOT" ]; then
+            echo "Android SDK root is not set"
+            exit 1
+          fi
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$SDK_ROOT" -type f -name sdkmanager | head -n 1)"
+          fi
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "sdkmanager not found under $SDK_ROOT"
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --install \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;29.0.14206865" \
+            "platform-tools"
+          {
+            echo "ANDROID_SDK_ROOT=$SDK_ROOT"
+            echo "BUILD_TOOLS_DIR=$SDK_ROOT/build-tools/36.0.0"
+            echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/29.0.14206865"
+          } >> "$GITHUB_ENV"
+
+      - name: Set build variables
+        shell: bash
+        env:
+          INPUT_PACKAGE_VARIANT: ${{ inputs.package_variant }}
+          INPUT_CREATE_RELEASE: ${{ inputs.create_release }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          PACKAGE_VARIANT="${INPUT_PACKAGE_VARIANT:-apt-android-7}"
+          CREATE_RELEASE="${INPUT_CREATE_RELEASE:-true}"
+          RELEASE_TAG_INPUT="${INPUT_RELEASE_TAG:-}"
+
+          CURRENT_VERSION_NAME_REGEX='\s+versionName "([^"]+)"$'
+          CURRENT_VERSION_NAME="$(grep -m 1 -E "$CURRENT_VERSION_NAME_REGEX" ./app/build.gradle | sed -r "s/$CURRENT_VERSION_NAME_REGEX/\1/")"
+          RELEASE_VERSION_NAME="v$CURRENT_VERSION_NAME+${GITHUB_SHA:0:7}"
+          VERSION_SEMVER="${RELEASE_VERSION_NAME/v/}"
+          if ! printf "%s" "$VERSION_SEMVER" | grep -qP '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$'; then
+            echo "The versionName '$VERSION_SEMVER' is not a valid version as per semantic version '2.0.0' spec."
+            exit 1
+          fi
+
+          RELEASE_TAG="${RELEASE_TAG_INPUT:-$RELEASE_VERSION_NAME}"
+          APK_VERSION_TAG="$RELEASE_VERSION_NAME-$PACKAGE_VARIANT-github-release"
+
+          {
+            echo "PACKAGE_VARIANT=$PACKAGE_VARIANT"
+            echo "CREATE_RELEASE=$CREATE_RELEASE"
+            echo "RELEASE_TAG=$RELEASE_TAG"
+            echo "RELEASE_VERSION_NAME=$RELEASE_VERSION_NAME"
+            echo "APK_VERSION_TAG=$APK_VERSION_TAG"
+            echo "TERMUX_APP_VERSION_NAME=$VERSION_SEMVER"
+            echo "TERMUX_APK_VERSION_TAG=$APK_VERSION_TAG"
+            echo "TERMUX_PACKAGE_VARIANT=$PACKAGE_VARIANT"
+          } >> "$GITHUB_ENV"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Cache Termux bootstrap zips
+        uses: actions/cache@v4
+        with:
+          path: app/src/main/cpp/bootstrap-*.zip
+          key: termux-bootstrap-${{ env.PACKAGE_VARIANT }}-${{ hashFiles('app/build.gradle') }}
+          restore-keys: |
+            termux-bootstrap-${{ env.PACKAGE_VARIANT }}-
+
+      - name: Cache release signing keystore
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/termux-release-keystore
+          key: termux-release-keystore-${{ github.repository }}
+
+      - name: Prepare signing keystore
+        shell: bash
+        env:
+          RELEASE_KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KS_DIR="${RUNNER_TEMP}/termux-release-keystore"
+          KEYSTORE="$KS_DIR/release.jks"
+          PWFILE="$KS_DIR/passwd"
+          mkdir -p "$KS_DIR"
+
+          if [ -n "${RELEASE_KEYSTORE_B64:-}" ]; then
+            echo "$RELEASE_KEYSTORE_B64" | base64 -d > "$KEYSTORE"
+            KS_PASS="${RELEASE_KEYSTORE_PASSWORD:?RELEASE_KEYSTORE_PASSWORD secret must be set when RELEASE_KEYSTORE_BASE64 is provided}"
+            KS_ALIAS="${RELEASE_KEY_ALIAS:-termux}"
+            KEY_PASS="${RELEASE_KEY_PASSWORD:-$KS_PASS}"
+            echo "Using release keystore provided via repository secret"
+          elif [ -f "$KEYSTORE" ] && [ -f "$PWFILE" ]; then
+            KS_PASS="$(cat "$PWFILE")"
+            KS_ALIAS="${RELEASE_KEY_ALIAS:-termux}"
+            KEY_PASS="${RELEASE_KEY_PASSWORD:-$KS_PASS}"
+            echo "Restored release keystore from Actions cache"
+          else
+            KS_PASS="$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-32)"
+            KS_ALIAS="termux"
+            KEY_PASS="$KS_PASS"
+            keytool -genkeypair \
+              -keystore "$KEYSTORE" -storetype JKS -alias "$KS_ALIAS" \
+              -keyalg RSA -keysize 4096 -validity 10000 \
+              -storepass "$KS_PASS" -keypass "$KS_PASS" \
+              -dname "CN=Termux Release, OU=Termux Fork, O=inkwise, L=Unknown, ST=Unknown, C=Unknown"
+            echo "$KS_PASS" > "$PWFILE"
+            echo "Generated a new release signing keystore (cached for future builds)"
+          fi
+
+          {
+            echo "RELEASE_KEYSTORE=$KEYSTORE"
+            echo "RELEASE_KEYSTORE_PASS=$KS_PASS"
+            echo "RELEASE_KEYSTORE_ALIAS=$KS_ALIAS"
+            echo "RELEASE_KEYSTORE_KEYPASS=$KEY_PASS"
+          } >> "$GITHUB_ENV"
+
+      - name: Build release APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon assembleRelease
+
+      - name: Sign release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT_DIR="app/build/outputs/apk/release"
+          APK=""
+          for f in "$OUT_DIR"/*.apk; do
+            [ -e "$f" ] || continue
+            if [ -n "$APK" ]; then
+              echo "Unexpected: multiple release APKs found in $OUT_DIR"
+              ls -l "$OUT_DIR"
+              exit 1
+            fi
+            APK="$f"
+          done
+          if [ -z "$APK" ]; then
+            echo "No release APK found in $OUT_DIR"
+            ls -l "$OUT_DIR" 2>/dev/null || true
+            exit 1
+          fi
+
+          BASE_NAME="termux-app_${APK_VERSION_TAG}_universal"
+          ALIGNED="$OUT_DIR/${BASE_NAME}.aligned.apk"
+          SIGNED="$OUT_DIR/${BASE_NAME}.apk"
+          ZIPALIGN="${BUILD_TOOLS_DIR}/zipalign"
+          APKSIGNER="${BUILD_TOOLS_DIR}/apksigner"
+
+          "$ZIPALIGN" -p -f 4 "$APK" "$ALIGNED"
+          "$APKSIGNER" sign \
+            --ks "$RELEASE_KEYSTORE" --ks-key-alias "$RELEASE_KEYSTORE_ALIAS" \
+            --ks-pass "pass:${RELEASE_KEYSTORE_PASS}" \
+            --key-pass "pass:${RELEASE_KEYSTORE_KEYPASS}" \
+            --out "$SIGNED" "$ALIGNED"
+          "$APKSIGNER" verify --verbose --print-certs "$SIGNED"
+
+          rm -f "$ALIGNED"
+          (cd "$OUT_DIR" && sha256sum "${BASE_NAME}.apk" > "${BASE_NAME}_sha256sums")
+
+          {
+            echo "SIGNED_APK=$SIGNED"
+            echo "SHA256SUMS=$OUT_DIR/${BASE_NAME}_sha256sums"
+            echo "APK_BASENAME=${BASE_NAME}"
+          } >> "$GITHUB_ENV"
+
+      - name: Upload release APK artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: termux-app_${{ env.APK_VERSION_TAG }}
+          path: |
+            app/build/outputs/apk/release/termux-app_*_universal.apk
+            app/build/outputs/apk/release/termux-app_*_sha256sums
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: env.CREATE_RELEASE == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ github.token }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Termux ${{ env.RELEASE_TAG }}
+          prerelease: false
+          fail_on_unmatched_files: true
+          body: |
+            Termux app **release** APK, built from the
+            [inkwise/termux-app](https://github.com/inkwise/termux-app) fork at
+            commit ${{ github.sha }}.
+
+            - Package variant: `${{ env.PACKAGE_VARIANT }}`
+            - Output: universal (all ABIs), signed with the fork's release keystore
+            - Base app version: `${{ env.RELEASE_VERSION_NAME }}` (see the bundled
+              `_sha256sums` file to verify the download)
+          files: |
+            ${{ env.SIGNED_APK }}
+            ${{ env.SHA256SUMS }}
