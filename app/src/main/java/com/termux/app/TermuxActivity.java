@@ -23,6 +23,7 @@ import android.view.WindowManager;
 import android.widget.EditText;
 import android.widget.ImageButton;
 import android.widget.ListView;
+import android.widget.TextView;
 import android.widget.RelativeLayout;
 import android.widget.Toast;
 
@@ -249,7 +250,7 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
 
         setNewSessionButtonView();
 
-        setToggleKeyboardView();
+        setToggleKeepScreenOnButtonView();
 
         registerForContextMenu(mTerminalView);
 
@@ -314,6 +315,10 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
 
         if (mTermuxTerminalViewClient != null)
             mTermuxTerminalViewClient.onResume();
+
+        // Re-apply the keep screen on preference (it may have been changed from the
+        // terminal context menu or from the Settings activity) and keep the sidebar button in sync
+        applyKeepScreenOnPreference();
 
         // Check if a crash happened on last run of the app or if a plugin crashed and show a
         // notification with the crash details if it did
@@ -582,16 +587,26 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         });
     }
 
-    private void setToggleKeyboardView() {
-        findViewById(R.id.toggle_keyboard_button).setOnClickListener(v -> {
-            mTermuxTerminalViewClient.onToggleSoftKeyboardRequest();
+    private void setToggleKeepScreenOnButtonView() {
+        findViewById(R.id.toggle_keep_screen_on_button).setOnClickListener(v -> {
+            mPreferences.setKeepScreenOn(!mPreferences.shouldKeepScreenOn());
+            applyKeepScreenOnPreference();
             getDrawer().closeDrawers();
         });
+        updateKeepScreenOnButtonView();
+    }
 
-        findViewById(R.id.toggle_keyboard_button).setOnLongClickListener(v -> {
-            toggleTerminalToolbar();
-            return true;
-        });
+    private void updateKeepScreenOnButtonView() {
+        View button = findViewById(R.id.toggle_keep_screen_on_button);
+        if (button == null) return;
+        boolean keepScreenOn = mPreferences.shouldKeepScreenOn();
+        ((TextView) button).setText(keepScreenOn ? R.string.action_screen_on : R.string.action_screen_off);
+    }
+
+    private void applyKeepScreenOnPreference() {
+        boolean keepScreenOn = mPreferences.shouldKeepScreenOn();
+        if (mTerminalView != null) mTerminalView.setKeepScreenOn(keepScreenOn);
+        updateKeepScreenOnButtonView();
     }
 
 
@@ -749,13 +764,8 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         }
     }
     private void toggleKeepScreenOn() {
-        if (mTerminalView.getKeepScreenOn()) {
-            mTerminalView.setKeepScreenOn(false);
-            mPreferences.setKeepScreenOn(false);
-        } else {
-            mTerminalView.setKeepScreenOn(true);
-            mPreferences.setKeepScreenOn(true);
-        }
+        mPreferences.setKeepScreenOn(!mPreferences.shouldKeepScreenOn());
+        applyKeepScreenOnPreference();
     }
 
 
