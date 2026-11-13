@@ -25,6 +25,9 @@ import android.view.MenuItem;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.view.animation.LinearInterpolator;
 import android.view.inputmethod.InputMethodManager;
@@ -138,6 +141,8 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
     private BiometricPrompt mBiometricPrompt;
     /** Whether a biometric authentication request is currently active. */
     private boolean mBiometricAuthenticating = false;
+    /** System UI visibility captured before entering lock fullscreen mode, restored on unlock. */
+    private int mSavedSystemUiVisibility = 0;
     /** Whether the activity is currently locked. */
     private boolean mIsLocked = false;
 
@@ -742,6 +747,8 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         mLockOverlay = overlay;
         overlay.requestFocus();
 
+        enterLockFullscreen();
+
         startLockOverlayCircularMotion(overlay, mLockContainer);
     }
 
@@ -862,6 +869,60 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         mLockAnimator = animator;
     }
 
+    /**
+     * Hide the status and navigation bars and keep the screen awake while the app is locked.
+     */
+    @SuppressWarnings("deprecation")
+    private void enterLockFullscreen() {
+        Window window = getWindow();
+        View decorView = window.getDecorView();
+        mSavedSystemUiVisibility = decorView.getSystemUiVisibility();
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(false);
+            WindowInsetsController controller = window.getInsetsController();
+            if (controller != null) {
+                controller.hide(WindowInsets.Type.systemBars());
+                controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            }
+        }
+        decorView.setSystemUiVisibility(
+            View.SYSTEM_UI_FLAG_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+
+        // Turn the screen on (if supported) and keep it awake while the app is locked.
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+            | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON);
+    }
+
+    /**
+     * Restore the status/navigation bars and the "Screen On" preference after the app is unlocked.
+     */
+    @SuppressWarnings("deprecation")
+    private void exitLockFullscreen() {
+        Window window = getWindow();
+        View decorView = window.getDecorView();
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(true);
+            WindowInsetsController controller = window.getInsetsController();
+            if (controller != null) {
+                controller.show(WindowInsets.Type.systemBars());
+            }
+        }
+        decorView.setSystemUiVisibility(mSavedSystemUiVisibility);
+
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+            | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON);
+
+        // Restore the user's screen-on preference (applied at the terminal view level).
+        applyKeepScreenOnPreference();
+    }
+
     private void unlockScreen() {
         if (!mIsLocked) return;
 
@@ -874,6 +935,7 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         }
 
         mIsLocked = false;
+        exitLockFullscreen();
         finishBiometricAuthentication();
         if (mLockHandler != null) mLockHandler.removeCallbacksAndMessages(null);
         mLockHandler = null;
