@@ -64,6 +64,8 @@
     <string name="msg_lock_fp_timeout">验证超时，请重新触摸锁图标</string>
     <string name="msg_lock_fp_failed">指纹不匹配，请重试</string>
     <string name="msg_lock_hold_hint">长按锁图标 2 秒解锁</string>
+    <string name="msg_biometric_unlock_title">解锁 Termux</string>
+    <string name="action_cancel">取消</string>
 
     <string name="msg_enabling_terminal_toolbar">Enabling Terminal Toolbar</string>
     <string name="msg_disabling_terminal_toolbar">Disabling Terminal Toolbar</string>
