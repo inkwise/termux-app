@@ -1,7 +1,6 @@
 package com.termux.app;
 
-import android.animation.AnimatorSet;
-import android.animation.ObjectAnimator;
+import android.animation.ValueAnimator;
 import android.annotation.SuppressLint;
 import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
@@ -18,7 +17,6 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
-import android.util.TypedValue;
 import android.view.ContextMenu;
 import android.view.ContextMenu.ContextMenuInfo;
 import android.view.Gravity;
@@ -28,7 +26,7 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
-import android.view.animation.AccelerateDecelerateInterpolator;
+import android.view.animation.LinearInterpolator;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -83,7 +81,6 @@ import androidx.drawerlayout.widget.DrawerLayout;
 import androidx.viewpager.widget.ViewPager;
 
 import java.util.Arrays;
-import java.util.Random;
 
 /**
  * A terminal emulator activity.
@@ -127,20 +124,16 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
     private TermuxAppSharedPreferences mPreferences;
     /** Overlay shown while the activity is locked (anti-mistouch mode), or null if not locked. */
     private View mLockOverlay;
-    /** Lock icon + hint container; drifted around to prevent burn-in. */
+    /** Lock icon container, kept in circular motion to prevent burn-in. */
     private View mLockContainer;
-    /** Hint text shown below the lock icon. */
-    private TextView mLockHint;
     /** Handler used for the fingerprint timeout and hold-to-unlock callbacks. */
     private Handler mLockHandler;
-    /** Repeating runnable that slowly moves the lock container to random positions. */
-    private Runnable mLockMoveRunnable;
     /** Runnable that unlocks the activity once the lock icon is held long enough. */
     private Runnable mLockHoldRunnable;
     /** Runnable that cancels the fingerprint authentication after a timeout. */
     private Runnable mLockTimeoutRunnable;
-    /** Currently running burn-in protection animation. */
-    private AnimatorSet mLockAnimator;
+    /** Animator that moves the lock icon in a circle around the screen center. */
+    private ValueAnimator mLockAnimator;
     /** The system biometric prompt, created lazily on first use. */
     private BiometricPrompt mBiometricPrompt;
     /** Whether a biometric authentication request is currently active. */
@@ -237,6 +230,8 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
     /** How long the system biometric prompt stays on screen without a successful scan before it
      *  is dismissed programmatically with {@link BiometricPrompt#cancelAuthentication()}. */
     private static final long BIOMETRIC_TIMEOUT_MS = 3000L;
+    /** One full circular lap of the lock icon around the screen center. */
+    private static final long CIRCLE_LAP_DURATION_MS = 60000L;
 
     private static final String LOG_TAG = "TermuxActivity";
 
@@ -685,10 +680,11 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
     /**
      * Lock the activity: draw a fully opaque black overlay on top of all content that consumes all
      * touch events and hides the keyboard, so accidental touches cannot reach the terminal.
-     * The overlay only shows a lock icon (with a short hint) that slowly drifts to random positions
-     * to prevent screen burn-in. With biometric hardware, touching the icon shows the system
-     * biometric prompt, which is automatically dismissed with {@link BiometricPrompt#cancelAuthentication()}
-     * after {@link #BIOMETRIC_TIMEOUT_MS} milliseconds without a successful scan. Without biometric
+     * The overlay shows only a lock icon, which circles the screen center at a constant speed
+     * (one full lap per minute) to prevent screen burn-in.
+     * With biometric hardware, touching the icon shows the system biometric prompt, which is
+     * automatically dismissed with {@link BiometricPrompt#cancelAuthentication()} after
+     * {@link #BIOMETRIC_TIMEOUT_MS} milliseconds without a successful scan. Without biometric
      * hardware the icon must be held for a couple of seconds to unlock.
      */
     private void lockScreen() {
@@ -710,32 +706,13 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         final float density = getResources().getDisplayMetrics().density;
         final boolean biometricAvailable = isBiometricAvailable();
 
-        LinearLayout container = new LinearLayout(this);
-        container.setOrientation(LinearLayout.VERTICAL);
-        container.setGravity(Gravity.CENTER);
-
         ImageButton lockIcon = new ImageButton(this);
         lockIcon.setImageResource(R.drawable.ic_lock);
         lockIcon.setColorFilter(Color.WHITE);
         lockIcon.setBackground(null);
         lockIcon.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
-
-        mLockHint = new TextView(this);
-        mLockHint.setTextColor(0xFFB0B0B0);
-        mLockHint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        mLockHint.setGravity(Gravity.CENTER);
-        mLockHint.setText(biometricAvailable ? R.string.msg_lock_fp_hint : R.string.msg_lock_hold_hint);
-
-        LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(
-            Math.round(64 * density), Math.round(64 * density));
-        iconLp.gravity = Gravity.CENTER_HORIZONTAL;
-        LinearLayout.LayoutParams hintLp = new LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        hintLp.gravity = Gravity.CENTER_HORIZONTAL;
-        hintLp.topMargin = Math.round(12 * density);
-
-        container.addView(lockIcon, iconLp);
-        container.addView(mLockHint, hintLp);
+        int iconPadding = Math.round(8 * density);
+        lockIcon.setPadding(iconPadding, iconPadding, iconPadding, iconPadding);
 
         mLockHandler = new Handler(Looper.getMainLooper());
         mLockHoldRunnable = this::unlockScreen;
@@ -756,16 +733,16 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
             return true;
         });
 
-        mLockContainer = container;
+        mLockContainer = lockIcon;
         overlay.addView(mLockContainer, new FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+            Math.round(64 * density), Math.round(64 * density), Gravity.CENTER));
 
         content.addView(overlay, new FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
         mLockOverlay = overlay;
         overlay.requestFocus();
 
-        startLockOverlayBurnInProtection(overlay, mLockContainer);
+        startLockOverlayCircularMotion(overlay, mLockContainer);
     }
 
     private boolean isBiometricAvailable() {
@@ -790,18 +767,14 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
             @Override
             public void onAuthenticationError(int errorCode, @NonNull CharSequence errString) {
                 if (isFinishing() || isDestroyed()) return;
-                boolean dismissed = errorCode == BiometricPrompt.ERROR_CANCELED
-                    || errorCode == BiometricPrompt.ERROR_USER_CANCELED
-                    || errorCode == BiometricPrompt.ERROR_NEGATIVE_BUTTON;
                 finishBiometricAuthentication();
                 if (mIsLocked)
-                    setLockHint(dismissed ? R.string.msg_lock_fp_timeout : R.string.msg_lock_fp_failed);
+                    Logger.logDebug(LOG_TAG, "Biometric authentication error: " + errorCode);
             }
 
             @Override
             public void onAuthenticationFailed() {
-                if (isFinishing() || isDestroyed() || !mIsLocked) return;
-                setLockHint(R.string.msg_lock_fp_failed);
+                if (isFinishing() || isDestroyed()) return;
             }
         };
 
@@ -819,7 +792,6 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         }
 
         mBiometricAuthenticating = true;
-        setLockHint(R.string.msg_lock_fp_authing);
         BiometricPrompt.PromptInfo promptInfo = new BiometricPrompt.PromptInfo.Builder()
             .setTitle(getString(R.string.msg_biometric_unlock_title))
             .setNegativeButtonText(getString(R.string.action_cancel))
@@ -830,7 +802,6 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         } catch (Exception e) {
             Logger.logError(LOG_TAG, "startBiometricAuthentication: " + e);
             finishBiometricAuthentication();
-            setLockHint(R.string.msg_lock_fp_failed);
             return;
         }
 
@@ -843,7 +814,6 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
                 } catch (Exception ignored) {
                 }
             }
-            if (mIsLocked) setLockHint(R.string.msg_lock_fp_timeout);
         };
         mLockHandler.postDelayed(mLockTimeoutRunnable, BIOMETRIC_TIMEOUT_MS);
     }
@@ -853,57 +823,45 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         if (mLockTimeoutRunnable != null && mLockHandler != null)
             mLockHandler.removeCallbacks(mLockTimeoutRunnable);
         mLockTimeoutRunnable = null;
-        if (mIsLocked) setLockHint(R.string.msg_lock_fp_hint);
-    }
-
-    private void setLockHint(int stringResId) {
-        if (mLockHint != null) mLockHint.setText(stringResId);
     }
 
     /**
-     * Slowly move the lock icon + hint container to random positions so that the statically locked
-     * screen does not burn in on OLED displays.
+     * Moves the lock icon in a circle around the screen center at a constant angular speed,
+     * completing one full lap per minute, so the static screen does not burn in on OLED
+     * displays.
      */
-    private void startLockOverlayBurnInProtection(final View overlay, final View lockView) {
-        final Random random = new Random();
-        final Runnable move = new Runnable() {
-            @Override
-            public void run() {
-                int width = overlay.getWidth();
-                int height = overlay.getHeight();
-                int iconWidth = lockView.getWidth();
-                int iconHeight = lockView.getHeight();
-                if (width <= iconWidth || height <= iconHeight) {
-                    overlay.postDelayed(this, 500);
-                    return;
-                }
+    private void startLockOverlayCircularMotion(final View overlay, final View lockView) {
+        final ValueAnimator animator = ValueAnimator.ofFloat(0f, (float) (2 * Math.PI));
+        animator.setDuration(CIRCLE_LAP_DURATION_MS);
+        animator.setInterpolator(new LinearInterpolator());
+        animator.setRepeatMode(ValueAnimator.RESTART);
+        animator.setRepeatCount(ValueAnimator.INFINITE);
+        animator.addUpdateListener(animation -> {
+            int width = overlay.getWidth();
+            int height = overlay.getHeight();
+            int iconWidth = lockView.getWidth();
+            int iconHeight = lockView.getHeight();
+            if (width <= 0 || height <= 0 || iconWidth <= 0 || iconHeight <= 0) return;
 
-                float density = getResources().getDisplayMetrics().density;
-                float padding = Math.round(24 * density);
-                float maxX = Math.max(width - iconWidth - 2 * padding, 0);
-                float maxY = Math.max(height - iconHeight - 2 * padding, 0);
+            float density = getResources().getDisplayMetrics().density;
+            float radius = Math.min(width, height) / 2f - Math.max(iconWidth, iconHeight) / 2f
+                - Math.round(16 * density);
+            if (radius < 0) radius = 0;
 
-                float targetX = padding + random.nextFloat() * maxX;
-                float targetY = padding + random.nextFloat() * maxY;
+            float angle = (float) animation.getAnimatedValue();
+            float centerX = width / 2f;
+            float centerY = height / 2f;
+            float targetCenterX = centerX + radius * (float) Math.cos(angle);
+            float targetCenterY = centerY + radius * (float) Math.sin(angle);
 
-                ObjectAnimator animatorX = ObjectAnimator.ofFloat(lockView, View.TRANSLATION_X,
-                    targetX - lockView.getLeft());
-                ObjectAnimator animatorY = ObjectAnimator.ofFloat(lockView, View.TRANSLATION_Y,
-                    targetY - lockView.getTop());
-                long duration = 1500L + random.nextInt(2500);
-                animatorX.setDuration(duration);
-                animatorY.setDuration(duration);
-                AnimatorSet set = new AnimatorSet();
-                set.playTogether(animatorX, animatorY);
-                set.setInterpolator(new AccelerateDecelerateInterpolator());
-                set.start();
-                mLockAnimator = set;
-
-                overlay.postDelayed(this, 3000L + random.nextInt(5000));
-            }
-        };
-        mLockMoveRunnable = move;
-        overlay.post(move);
+            // The icon is laid out centered; the translation is relative to that position.
+            float laidOutCenterX = lockView.getLeft() + iconWidth / 2f;
+            float laidOutCenterY = lockView.getTop() + iconHeight / 2f;
+            lockView.setTranslationX(targetCenterX - laidOutCenterX);
+            lockView.setTranslationY(targetCenterY - laidOutCenterY);
+        });
+        animator.start();
+        mLockAnimator = animator;
     }
 
     private void unlockScreen() {
@@ -924,9 +882,6 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         mLockHoldRunnable = null;
         mLockTimeoutRunnable = null;
 
-        if (mLockOverlay != null && mLockMoveRunnable != null)
-            mLockOverlay.removeCallbacks(mLockMoveRunnable);
-        mLockMoveRunnable = null;
         if (mLockAnimator != null) {
             mLockAnimator.cancel();
             mLockAnimator = null;
@@ -938,7 +893,6 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
             mLockOverlay = null;
         }
         mLockContainer = null;
-        mLockHint = null;
         if (mTerminalView != null) mTerminalView.requestFocus();
     }
 
