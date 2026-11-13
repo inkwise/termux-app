@@ -9,7 +9,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.ServiceConnection;
+import android.graphics.Color;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
@@ -21,8 +23,14 @@ import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
+import android.util.TypedValue;
 import android.view.WindowManager;
+import android.view.inputmethod.InputMethodManager;
+import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
+import android.widget.ImageView;
+import android.widget.LinearLayout;
 import android.widget.ImageButton;
 import android.widget.ListView;
 import android.widget.TextView;
@@ -65,10 +73,14 @@ import com.termux.view.TerminalViewClient;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.biometric.BiometricManager;
+import androidx.biometric.BiometricPrompt;
+import androidx.core.content.ContextCompat;
 import androidx.drawerlayout.widget.DrawerLayout;
 import androidx.viewpager.widget.ViewPager;
 
 import java.util.Arrays;
+import java.util.concurrent.Executor;
 
 /**
  * A terminal emulator activity.
@@ -110,6 +122,10 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
      * Termux app shared preferences manager.
      */
     private TermuxAppSharedPreferences mPreferences;
+    /** Overlay shown while the activity is locked (anti-mistouch mode), or null if not locked. */
+    private View mLockOverlay;
+    /** Whether the activity is currently locked and requires biometric authentication to unlock. */
+    private boolean mIsLocked = false;
 
     /**
      * Termux app SharedProperties loaded from termux.properties
@@ -194,6 +210,7 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
 
     private static final String ARG_TERMINAL_TOOLBAR_TEXT_INPUT = "terminal_toolbar_text_input";
     private static final String ARG_ACTIVITY_RECREATED = "activity_recreated";
+    private static final String ARG_ACTIVITY_LOCKED = "activity_locked";
 
     private static final String LOG_TAG = "TermuxActivity";
 
@@ -253,6 +270,11 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         setNewSessionButtonView();
 
         setToggleKeepScreenOnButtonView();
+
+        setLockButtonView();
+
+        if (savedInstanceState != null && savedInstanceState.getBoolean(ARG_ACTIVITY_LOCKED, false))
+            lockScreen(false);
 
         registerForContextMenu(mTerminalView);
 
@@ -379,6 +401,7 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         super.onSaveInstanceState(savedInstanceState);
         saveTerminalToolbarTextInput(savedInstanceState);
         savedInstanceState.putBoolean(ARG_ACTIVITY_RECREATED, true);
+        savedInstanceState.putBoolean(ARG_ACTIVITY_LOCKED, mIsLocked);
     }
 
 
@@ -626,6 +649,172 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         updateKeepScreenOnButtonView();
     }
 
+    private void setLockButtonView() {
+        findViewById(R.id.lock_button).setOnClickListener(v -> {
+            getDrawer().closeDrawers();
+            lockScreen(true);
+        });
+    }
+
+    /**
+     * Lock the activity: draw a full screen overlay on top of all content that consumes all touch
+     * events and hide the keyboard, so accidental touches cannot reach the terminal.
+     * Unlocking requires biometric authentication (fingerprint). If the device has no usable
+     * biometric hardware, a long press on the unlock button is used as a fallback.
+     */
+    private void lockScreen(boolean showPrompt) {
+        if (mIsLocked) return;
+        mIsLocked = true;
+
+        hideSoftKeyboard();
+        if (mTerminalView != null) mTerminalView.clearFocus();
+
+        ViewGroup content = findViewById(android.R.id.content);
+        FrameLayout overlay = new FrameLayout(this);
+        overlay.setBackgroundColor(0xF0000000);
+        overlay.setClickable(true);
+        overlay.setFocusable(true);
+        overlay.setFocusableInTouchMode(true);
+        overlay.setOnTouchListener((v, e) -> true); // consume all touches
+
+        final float density = getResources().getDisplayMetrics().density;
+        boolean biometricAvailable = isBiometricAvailable();
+
+        LinearLayout column = new LinearLayout(this);
+        column.setOrientation(LinearLayout.VERTICAL);
+        column.setGravity(Gravity.CENTER);
+        column.setPadding(Math.round(32 * density), 0, Math.round(32 * density), 0);
+
+        ImageView icon = new ImageView(this);
+        icon.setImageResource(R.drawable.ic_lock);
+        icon.setColorFilter(Color.WHITE);
+
+        TextView title = new TextView(this);
+        title.setText(R.string.msg_termux_locked);
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
+        title.setGravity(Gravity.CENTER);
+
+        TextView hint = new TextView(this);
+        hint.setTextColor(0xFFB0B0B0);
+        hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        hint.setGravity(Gravity.CENTER);
+        hint.setText(biometricAvailable ? R.string.msg_termux_locked_hint : R.string.msg_no_biometric_hint);
+
+        Button unlockButton = new Button(this);
+        unlockButton.setText(R.string.action_unlock_screen);
+        unlockButton.setAllCaps(false);
+        unlockButton.setOnClickListener(v -> {
+            if (biometricAvailable && isBiometricAvailable()) {
+                showBiometricPrompt();
+            } else {
+                Toast.makeText(this, R.string.msg_no_biometric_hint, Toast.LENGTH_SHORT).show();
+            }
+        });
+        unlockButton.setOnLongClickListener(v -> {
+            if (biometricAvailable) {
+                showBiometricPrompt();
+            } else {
+                unlockScreen();
+            }
+            return true;
+        });
+
+        LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(
+            Math.round(64 * density), Math.round(64 * density));
+        iconLp.gravity = Gravity.CENTER_HORIZONTAL;
+        column.addView(icon, iconLp);
+
+        LinearLayout.LayoutParams titleLp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        titleLp.gravity = Gravity.CENTER_HORIZONTAL;
+        titleLp.topMargin = Math.round(16 * density);
+        column.addView(title, titleLp);
+
+        LinearLayout.LayoutParams hintLp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        hintLp.gravity = Gravity.CENTER_HORIZONTAL;
+        hintLp.topMargin = Math.round(8 * density);
+        column.addView(hint, hintLp);
+
+        LinearLayout.LayoutParams buttonLp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        buttonLp.gravity = Gravity.CENTER_HORIZONTAL;
+        buttonLp.topMargin = Math.round(24 * density);
+        column.addView(unlockButton, buttonLp);
+
+        overlay.addView(column, new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        content.addView(overlay, new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        mLockOverlay = overlay;
+        overlay.requestFocus();
+
+        if (showPrompt && biometricAvailable)
+            overlay.postDelayed(this::showBiometricPrompt, 250);
+    }
+
+    private boolean isBiometricAvailable() {
+        try {
+            return BiometricManager.from(this)
+                .canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK) == BiometricManager.BIOMETRIC_SUCCESS;
+        } catch (Exception e) {
+            Logger.logError(LOG_TAG, "isBiometricAvailable: " + e);
+            return false;
+        }
+    }
+
+    private void showBiometricPrompt() {
+        if (!mIsLocked) return;
+        Executor executor = ContextCompat.getMainExecutor(this);
+        BiometricPrompt prompt = new BiometricPrompt(this, executor,
+            new BiometricPrompt.AuthenticationCallback() {
+                @Override
+                public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult result) {
+                    if (isFinishing() || isDestroyed()) return;
+                    unlockScreen();
+                }
+
+                @Override
+                public void onAuthenticationFailed() {
+                    // Keep the overlay; the system dialog already indicated the failure.
+                }
+
+                @Override
+                public void onAuthenticationError(int errorCode, @NonNull CharSequence errString) {
+                    if (errorCode == BiometricPrompt.ERROR_USER_CANCELED
+                        || errorCode == BiometricPrompt.ERROR_NEGATIVE_BUTTON) {
+                        return; // Stay locked.
+                    }
+                    Logger.logError(LOG_TAG, "Biometric authentication error: " + errString);
+                }
+            });
+        BiometricPrompt.PromptInfo promptInfo = new BiometricPrompt.PromptInfo.Builder()
+            .setTitle(getString(R.string.msg_biometric_unlock_title))
+            .setNegativeButtonText(getString(R.string.action_cancel))
+            .setConfirmationRequired(false)
+            .build();
+        prompt.authenticate(promptInfo);
+    }
+
+    private void unlockScreen() {
+        if (!mIsLocked) return;
+        mIsLocked = false;
+
+        ViewGroup content = findViewById(android.R.id.content);
+        if (mLockOverlay != null) {
+            content.removeView(mLockOverlay);
+            mLockOverlay = null;
+        }
+        if (mTerminalView != null) mTerminalView.requestFocus();
+    }
+
+    private void hideSoftKeyboard() {
+        InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+        if (imm != null && mTerminalView != null)
+            imm.hideSoftInputFromWindow(mTerminalView.getWindowToken(), 0);
+    }
+
 
 
 
@@ -633,6 +822,11 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
     @SuppressLint("RtlHardcoded")
     @Override
     public void onBackPressed() {
+        if (mIsLocked) {
+            // The activity is locked; ignore back presses until it is unlocked with biometrics.
+            return;
+        }
+
         if (getDrawer().isDrawerOpen(Gravity.LEFT)) {
             getDrawer().closeDrawers();
         } else {

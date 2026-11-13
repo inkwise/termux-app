@@ -77,17 +77,40 @@
                     <com.google.android.material.button.MaterialButton
                         android:id="@+id/toggle_keep_screen_on_button"
                         style="?android:attr/buttonBarButtonStyle"
-                        android:layout_width="match_parent"
+                        android:layout_width="0dp"
                         android:layout_height="wrap_content"
                         android:layout_weight="1"
+                        android:minWidth="0dp"
+                        android:paddingStart="2dp"
+                        android:paddingEnd="2dp"
+                        android:maxLines="1"
+                        android:textSize="10sp"
                         android:text="@string/action_screen_off" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/lock_button"
+                        style="?android:attr/buttonBarButtonStyle"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:minWidth="0dp"
+                        android:paddingStart="2dp"
+                        android:paddingEnd="2dp"
+                        android:maxLines="1"
+                        android:textSize="10sp"
+                        android:text="@string/action_lock_screen" />
 
                     <com.google.android.material.button.MaterialButton
                         android:id="@+id/new_session_button"
                         style="?android:attr/buttonBarButtonStyle"
-                        android:layout_width="match_parent"
+                        android:layout_width="0dp"
                         android:layout_height="wrap_content"
                         android:layout_weight="1"
+                        android:minWidth="0dp"
+                        android:paddingStart="2dp"
+                        android:paddingEnd="2dp"
+                        android:maxLines="1"
+                        android:textSize="10sp"
                         android:text="@string/action_new_session" />
                 </LinearLayout>
             </LinearLayout>

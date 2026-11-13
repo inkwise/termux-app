@@ -57,6 +57,15 @@
     <string name="msg_screen_on_enabled">屏幕常亮已开启，不会自动息屏</string>
     <string name="msg_screen_on_disabled">已恢复自动息屏</string>
 
+    <!-- Screen lock (anti-mistouch) -->
+    <string name="action_lock_screen">Lock</string>
+    <string name="msg_termux_locked">Termux 已锁定</string>
+    <string name="msg_termux_locked_hint">点按下方按钮使用指纹解锁</string>
+    <string name="msg_no_biometric_hint">当前设备没有可用的指纹，请长按下方按钮解锁</string>
+    <string name="action_unlock_screen">指纹解锁</string>
+    <string name="msg_biometric_unlock_title">解锁 Termux</string>
+    <string name="action_cancel">取消</string>
+
     <string name="msg_enabling_terminal_toolbar">Enabling Terminal Toolbar</string>
     <string name="msg_disabling_terminal_toolbar">Disabling Terminal Toolbar</string>
 
