@@ -11,7 +11,9 @@ import android.content.IntentFilter;
 import android.content.ServiceConnection;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.view.ContextMenu;
 import android.view.ContextMenu.ContextMenuInfo;
 import android.view.Gravity;
@@ -591,9 +593,24 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         findViewById(R.id.toggle_keep_screen_on_button).setOnClickListener(v -> {
             mPreferences.setKeepScreenOn(!mPreferences.shouldKeepScreenOn());
             applyKeepScreenOnPreference();
+            showScreenOnStateToast();
             getDrawer().closeDrawers();
         });
         updateKeepScreenOnButtonView();
+    }
+
+    /**
+     * Show a short (~1 second) toast that unambiguously states whether the screen will now
+     * stay on or is allowed to time out again.
+     */
+    private void showScreenOnStateToast() {
+        boolean keepScreenOn = mPreferences.shouldKeepScreenOn();
+        Toast toast = Toast.makeText(this,
+            keepScreenOn ? R.string.msg_screen_on_enabled : R.string.msg_screen_on_disabled,
+            Toast.LENGTH_SHORT);
+        toast.show();
+        // Dismiss after ~1 second instead of the default ~2 seconds
+        new Handler(Looper.getMainLooper()).postDelayed(toast::cancel, 1000);
     }
 
     private void updateKeepScreenOnButtonView() {
