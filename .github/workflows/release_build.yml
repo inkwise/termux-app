@@ -198,6 +198,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The Gradle task graph does not order the NDK build after
+          # downloadBootstraps, so download the bootstrap packages first in a
+          # dedicated invocation to make the build deterministic.
+          echo "Downloading Termux bootstrap packages for '$TERMUX_PACKAGE_VARIANT'"
+          ./gradlew --no-daemon downloadBootstraps
+          for abi in aarch64 arm i686 x86_64; do
+            if [ ! -f "app/src/main/cpp/bootstrap-$abi.zip" ]; then
+              echo "Missing bootstrap-$abi.zip after downloadBootstraps"
+              exit 1
+            fi
+          done
+          echo "Building release APKs"
           ./gradlew --no-daemon assembleRelease
 
       - name: Sign release APK
