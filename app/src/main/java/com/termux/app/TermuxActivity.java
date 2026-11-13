@@ -1,5 +1,7 @@
 package com.termux.app;
 
+import android.animation.AnimatorSet;
+import android.animation.ObjectAnimator;
 import android.annotation.SuppressLint;
 import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
@@ -11,7 +13,6 @@ import android.content.IntentFilter;
 import android.content.ServiceConnection;
 import android.graphics.Color;
 import android.net.Uri;
-import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
@@ -21,12 +22,12 @@ import android.view.ContextMenu.ContextMenuInfo;
 import android.view.Gravity;
 import android.view.Menu;
 import android.view.MenuItem;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
-import android.util.TypedValue;
 import android.view.WindowManager;
+import android.view.animation.AccelerateDecelerateInterpolator;
 import android.view.inputmethod.InputMethodManager;
-import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
@@ -73,14 +74,11 @@ import com.termux.view.TerminalViewClient;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatActivity;
-import androidx.biometric.BiometricManager;
-import androidx.biometric.BiometricPrompt;
-import androidx.core.content.ContextCompat;
 import androidx.drawerlayout.widget.DrawerLayout;
 import androidx.viewpager.widget.ViewPager;
 
 import java.util.Arrays;
-import java.util.concurrent.Executor;
+import java.util.Random;
 
 /**
  * A terminal emulator activity.
@@ -124,7 +122,15 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
     private TermuxAppSharedPreferences mPreferences;
     /** Overlay shown while the activity is locked (anti-mistouch mode), or null if not locked. */
     private View mLockOverlay;
-    /** Whether the activity is currently locked and requires biometric authentication to unlock. */
+    /** The lock icon shown on the lock overlay, if visible. */
+    private ImageButton mLockIcon;
+    /** Repeating runnable that slowly moves the lock icon to random positions. */
+    private Runnable mLockMoveRunnable;
+    /** Runnable that unlocks the activity once the lock icon is held long enough. */
+    private Runnable mLockUnlockRunnable;
+    /** Currently running burn-in protection animation. */
+    private AnimatorSet mLockAnimator;
+    /** Whether the activity is currently locked and requires a long press on the lock icon to unlock. */
     private boolean mIsLocked = false;
 
     /**
@@ -211,6 +217,8 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
     private static final String ARG_TERMINAL_TOOLBAR_TEXT_INPUT = "terminal_toolbar_text_input";
     private static final String ARG_ACTIVITY_RECREATED = "activity_recreated";
     private static final String ARG_ACTIVITY_LOCKED = "activity_locked";
+    /** Hold duration on the lock icon required to unlock the activity. */
+    private static final long UNLOCK_HOLD_TIMEOUT_MS = 2000L;
 
     private static final String LOG_TAG = "TermuxActivity";
 
@@ -274,7 +282,7 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         setLockButtonView();
 
         if (savedInstanceState != null && savedInstanceState.getBoolean(ARG_ACTIVITY_LOCKED, false))
-            lockScreen(false);
+            lockScreen();
 
         registerForContextMenu(mTerminalView);
 
@@ -652,17 +660,17 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
     private void setLockButtonView() {
         findViewById(R.id.lock_button).setOnClickListener(v -> {
             getDrawer().closeDrawers();
-            lockScreen(true);
+            lockScreen();
         });
     }
 
     /**
-     * Lock the activity: draw a full screen overlay on top of all content that consumes all touch
-     * events and hide the keyboard, so accidental touches cannot reach the terminal.
-     * Unlocking requires biometric authentication (fingerprint). If the device has no usable
-     * biometric hardware, a long press on the unlock button is used as a fallback.
+     * Lock the activity: draw a fully opaque black overlay on top of all content that consumes all
+     * touch events and hides the keyboard, so accidental touches cannot reach the terminal.
+     * The overlay only shows a lock icon, which slowly drifts to random positions to prevent
+     * screen burn-in, and must be held for a couple of seconds to unlock.
      */
-    private void lockScreen(boolean showPrompt) {
+    private void lockScreen() {
         if (mIsLocked) return;
         mIsLocked = true;
 
@@ -671,141 +679,114 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
 
         ViewGroup content = findViewById(android.R.id.content);
         FrameLayout overlay = new FrameLayout(this);
-        overlay.setBackgroundColor(0xF0000000);
+        overlay.setBackgroundColor(Color.BLACK);
         overlay.setClickable(true);
         overlay.setFocusable(true);
         overlay.setFocusableInTouchMode(true);
         overlay.setOnTouchListener((v, e) -> true); // consume all touches
 
         final float density = getResources().getDisplayMetrics().density;
-        boolean biometricAvailable = isBiometricAvailable();
 
-        LinearLayout column = new LinearLayout(this);
-        column.setOrientation(LinearLayout.VERTICAL);
-        column.setGravity(Gravity.CENTER);
-        column.setPadding(Math.round(32 * density), 0, Math.round(32 * density), 0);
+        ImageButton lockIcon = new ImageButton(this);
+        lockIcon.setImageResource(R.drawable.ic_lock);
+        lockIcon.setColorFilter(Color.WHITE);
+        lockIcon.setBackground(null);
+        lockIcon.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
 
-        ImageView icon = new ImageView(this);
-        icon.setImageResource(R.drawable.ic_lock);
-        icon.setColorFilter(Color.WHITE);
-
-        TextView title = new TextView(this);
-        title.setText(R.string.msg_termux_locked);
-        title.setTextColor(Color.WHITE);
-        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
-        title.setGravity(Gravity.CENTER);
-
-        TextView hint = new TextView(this);
-        hint.setTextColor(0xFFB0B0B0);
-        hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        hint.setGravity(Gravity.CENTER);
-        hint.setText(biometricAvailable ? R.string.msg_termux_locked_hint : R.string.msg_no_biometric_hint);
-
-        Button unlockButton = new Button(this);
-        unlockButton.setText(R.string.action_unlock_screen);
-        unlockButton.setAllCaps(false);
-        unlockButton.setOnClickListener(v -> {
-            if (biometricAvailable && isBiometricAvailable()) {
-                showBiometricPrompt();
-            } else {
-                Toast.makeText(this, R.string.msg_no_biometric_hint, Toast.LENGTH_SHORT).show();
-            }
-        });
-        unlockButton.setOnLongClickListener(v -> {
-            if (biometricAvailable) {
-                showBiometricPrompt();
-            } else {
-                unlockScreen();
+        mLockUnlockRunnable = this::unlockScreen;
+        lockIcon.setOnTouchListener((v, event) -> {
+            int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_DOWN) {
+                // Give visual feedback and start the unlock hold timer. A plain tap will be
+                // cancelled on ACTION_UP before it can unlock the activity.
+                v.animate().scaleX(1.15f).scaleY(1.15f).setDuration(150).start();
+                v.postDelayed(mLockUnlockRunnable, UNLOCK_HOLD_TIMEOUT_MS);
+            } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                v.removeCallbacks(mLockUnlockRunnable);
+                v.animate().scaleX(1.0f).scaleY(1.0f).setDuration(150).start();
             }
             return true;
         });
 
-        LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(
-            Math.round(64 * density), Math.round(64 * density));
-        iconLp.gravity = Gravity.CENTER_HORIZONTAL;
-        column.addView(icon, iconLp);
+        overlay.addView(lockIcon, new FrameLayout.LayoutParams(
+            Math.round(64 * density), Math.round(64 * density), Gravity.CENTER));
 
-        LinearLayout.LayoutParams titleLp = new LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        titleLp.gravity = Gravity.CENTER_HORIZONTAL;
-        titleLp.topMargin = Math.round(16 * density);
-        column.addView(title, titleLp);
-
-        LinearLayout.LayoutParams hintLp = new LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        hintLp.gravity = Gravity.CENTER_HORIZONTAL;
-        hintLp.topMargin = Math.round(8 * density);
-        column.addView(hint, hintLp);
-
-        LinearLayout.LayoutParams buttonLp = new LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        buttonLp.gravity = Gravity.CENTER_HORIZONTAL;
-        buttonLp.topMargin = Math.round(24 * density);
-        column.addView(unlockButton, buttonLp);
-
-        overlay.addView(column, new FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
         content.addView(overlay, new FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
         mLockOverlay = overlay;
+        mLockIcon = lockIcon;
         overlay.requestFocus();
 
-        if (showPrompt && biometricAvailable)
-            overlay.postDelayed(this::showBiometricPrompt, 250);
+        startLockOverlayBurnInProtection(overlay, lockIcon);
     }
 
-    private boolean isBiometricAvailable() {
-        try {
-            return BiometricManager.from(this)
-                .canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK) == BiometricManager.BIOMETRIC_SUCCESS;
-        } catch (Exception e) {
-            Logger.logError(LOG_TAG, "isBiometricAvailable: " + e);
-            return false;
-        }
-    }
-
-    private void showBiometricPrompt() {
-        if (!mIsLocked) return;
-        Executor executor = ContextCompat.getMainExecutor(this);
-        BiometricPrompt prompt = new BiometricPrompt(this, executor,
-            new BiometricPrompt.AuthenticationCallback() {
-                @Override
-                public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult result) {
-                    if (isFinishing() || isDestroyed()) return;
-                    unlockScreen();
+    /**
+     * Slowly move the lock icon to random positions so that the statically locked screen does not
+     * burn in on OLED displays.
+     */
+    private void startLockOverlayBurnInProtection(final View overlay, final View lockView) {
+        final Random random = new Random();
+        final Runnable move = new Runnable() {
+            @Override
+            public void run() {
+                int width = overlay.getWidth();
+                int height = overlay.getHeight();
+                int iconWidth = lockView.getWidth();
+                int iconHeight = lockView.getHeight();
+                if (width <= iconWidth || height <= iconHeight) {
+                    overlay.postDelayed(this, 500);
+                    return;
                 }
 
-                @Override
-                public void onAuthenticationFailed() {
-                    // Keep the overlay; the system dialog already indicated the failure.
-                }
+                float density = getResources().getDisplayMetrics().density;
+                float padding = Math.round(24 * density);
+                float maxX = Math.max(width - iconWidth - 2 * padding, 0);
+                float maxY = Math.max(height - iconHeight - 2 * padding, 0);
 
-                @Override
-                public void onAuthenticationError(int errorCode, @NonNull CharSequence errString) {
-                    if (errorCode == BiometricPrompt.ERROR_USER_CANCELED
-                        || errorCode == BiometricPrompt.ERROR_NEGATIVE_BUTTON) {
-                        return; // Stay locked.
-                    }
-                    Logger.logError(LOG_TAG, "Biometric authentication error: " + errString);
-                }
-            });
-        BiometricPrompt.PromptInfo promptInfo = new BiometricPrompt.PromptInfo.Builder()
-            .setTitle(getString(R.string.msg_biometric_unlock_title))
-            .setNegativeButtonText(getString(R.string.action_cancel))
-            .setConfirmationRequired(false)
-            .build();
-        prompt.authenticate(promptInfo);
+                float targetX = padding + random.nextFloat() * maxX;
+                float targetY = padding + random.nextFloat() * maxY;
+
+                ObjectAnimator animatorX = ObjectAnimator.ofFloat(lockView, View.TRANSLATION_X,
+                    targetX - lockView.getLeft());
+                ObjectAnimator animatorY = ObjectAnimator.ofFloat(lockView, View.TRANSLATION_Y,
+                    targetY - lockView.getTop());
+                long duration = 1500L + random.nextInt(2500);
+                animatorX.setDuration(duration);
+                animatorY.setDuration(duration);
+                AnimatorSet set = new AnimatorSet();
+                set.playTogether(animatorX, animatorY);
+                set.setInterpolator(new AccelerateDecelerateInterpolator());
+                set.start();
+                mLockAnimator = set;
+
+                overlay.postDelayed(this, 3000L + random.nextInt(5000));
+            }
+        };
+        mLockMoveRunnable = move;
+        overlay.post(move);
     }
 
     private void unlockScreen() {
         if (!mIsLocked) return;
         mIsLocked = false;
 
+        if (mLockOverlay != null) {
+            if (mLockMoveRunnable != null) mLockOverlay.removeCallbacks(mLockMoveRunnable);
+            if (mLockIcon != null && mLockUnlockRunnable != null) mLockIcon.removeCallbacks(mLockUnlockRunnable);
+        }
+        mLockMoveRunnable = null;
+        mLockUnlockRunnable = null;
+        if (mLockAnimator != null) {
+            mLockAnimator.cancel();
+            mLockAnimator = null;
+        }
+
         ViewGroup content = findViewById(android.R.id.content);
         if (mLockOverlay != null) {
             content.removeView(mLockOverlay);
             mLockOverlay = null;
         }
+        mLockIcon = null;
         if (mTerminalView != null) mTerminalView.requestFocus();
     }
 
@@ -815,15 +796,11 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
             imm.hideSoftInputFromWindow(mTerminalView.getWindowToken(), 0);
     }
 
-
-
-
-
     @SuppressLint("RtlHardcoded")
     @Override
     public void onBackPressed() {
         if (mIsLocked) {
-            // The activity is locked; ignore back presses until it is unlocked with biometrics.
+            // The activity is locked; ignore back presses until the lock icon is long pressed.
             return;
         }
 
