@@ -12,11 +12,15 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.ServiceConnection;
 import android.graphics.Color;
+import android.hardware.fingerprint.FingerprintManager;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.CancellationSignal;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.util.TypedValue;
 import android.view.ContextMenu;
 import android.view.ContextMenu.ContextMenuInfo;
 import android.view.Gravity;
@@ -122,15 +126,25 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
     private TermuxAppSharedPreferences mPreferences;
     /** Overlay shown while the activity is locked (anti-mistouch mode), or null if not locked. */
     private View mLockOverlay;
-    /** The lock icon shown on the lock overlay, if visible. */
-    private ImageButton mLockIcon;
-    /** Repeating runnable that slowly moves the lock icon to random positions. */
+    /** Lock icon + hint container; drifted around to prevent burn-in. */
+    private View mLockContainer;
+    /** Hint text shown below the lock icon. */
+    private TextView mLockHint;
+    /** Handler used for the fingerprint timeout and hold-to-unlock callbacks. */
+    private Handler mLockHandler;
+    /** Repeating runnable that slowly moves the lock container to random positions. */
     private Runnable mLockMoveRunnable;
     /** Runnable that unlocks the activity once the lock icon is held long enough. */
-    private Runnable mLockUnlockRunnable;
+    private Runnable mLockHoldRunnable;
+    /** Runnable that cancels the fingerprint authentication after a timeout. */
+    private Runnable mLockTimeoutRunnable;
     /** Currently running burn-in protection animation. */
     private AnimatorSet mLockAnimator;
-    /** Whether the activity is currently locked and requires a long press on the lock icon to unlock. */
+    /** Signal used to cancel the active fingerprint authentication request. */
+    private CancellationSignal mFingerprintSignal;
+    /** Whether a fingerprint authentication request is currently active. */
+    private boolean mFingerprintAuthenticating = false;
+    /** Whether the activity is currently locked. */
     private boolean mIsLocked = false;
 
     /**
@@ -217,8 +231,10 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
     private static final String ARG_TERMINAL_TOOLBAR_TEXT_INPUT = "terminal_toolbar_text_input";
     private static final String ARG_ACTIVITY_RECREATED = "activity_recreated";
     private static final String ARG_ACTIVITY_LOCKED = "activity_locked";
-    /** Hold duration on the lock icon required to unlock the activity. */
+    /** Hold duration on the lock icon required to unlock the activity when no fingerprint is available. */
     private static final long UNLOCK_HOLD_TIMEOUT_MS = 2000L;
+    /** How long a fingerprint authentication request stays active without a successful scan. */
+    private static final long FINGERPRINT_TIMEOUT_MS = 3000L;
 
     private static final String LOG_TAG = "TermuxActivity";
 
@@ -667,12 +683,15 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
     /**
      * Lock the activity: draw a fully opaque black overlay on top of all content that consumes all
      * touch events and hides the keyboard, so accidental touches cannot reach the terminal.
-     * The overlay only shows a lock icon, which slowly drifts to random positions to prevent
-     * screen burn-in, and must be held for a couple of seconds to unlock.
+     * The overlay only shows a lock icon (with a short hint) that slowly drifts to random positions
+     * to prevent screen burn-in. With fingerprint hardware, touching the icon starts a dialog-less
+     * fingerprint scan that is cancelled after a few seconds of inactivity; without fingerprint
+     * hardware the icon must be held for a couple of seconds to unlock.
      */
     private void lockScreen() {
         if (mIsLocked) return;
         mIsLocked = true;
+        mFingerprintAuthenticating = false;
 
         hideSoftKeyboard();
         if (mTerminalView != null) mTerminalView.clearFocus();
@@ -686,6 +705,11 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         overlay.setOnTouchListener((v, e) -> true); // consume all touches
 
         final float density = getResources().getDisplayMetrics().density;
+        final boolean fingerprintAvailable = isFingerprintAvailable();
+
+        LinearLayout container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+        container.setGravity(Gravity.CENTER);
 
         ImageButton lockIcon = new ImageButton(this);
         lockIcon.setImageResource(R.drawable.ic_lock);
@@ -693,36 +717,155 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         lockIcon.setBackground(null);
         lockIcon.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
 
-        mLockUnlockRunnable = this::unlockScreen;
+        mLockHint = new TextView(this);
+        mLockHint.setTextColor(0xFFB0B0B0);
+        mLockHint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        mLockHint.setGravity(Gravity.CENTER);
+        mLockHint.setText(fingerprintAvailable ? R.string.msg_lock_fp_hint : R.string.msg_lock_hold_hint);
+
+        LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(
+            Math.round(64 * density), Math.round(64 * density));
+        iconLp.gravity = Gravity.CENTER_HORIZONTAL;
+        LinearLayout.LayoutParams hintLp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        hintLp.gravity = Gravity.CENTER_HORIZONTAL;
+        hintLp.topMargin = Math.round(12 * density);
+
+        container.addView(lockIcon, iconLp);
+        container.addView(mLockHint, hintLp);
+
+        mLockHandler = new Handler(Looper.getMainLooper());
+        mLockHoldRunnable = this::unlockScreen;
+
         lockIcon.setOnTouchListener((v, event) -> {
             int action = event.getActionMasked();
             if (action == MotionEvent.ACTION_DOWN) {
-                // Give visual feedback and start the unlock hold timer. A plain tap will be
-                // cancelled on ACTION_UP before it can unlock the activity.
                 v.animate().scaleX(1.15f).scaleY(1.15f).setDuration(150).start();
-                v.postDelayed(mLockUnlockRunnable, UNLOCK_HOLD_TIMEOUT_MS);
+                if (fingerprintAvailable) {
+                    startFingerprintAuthentication();
+                } else {
+                    mLockHandler.postDelayed(mLockHoldRunnable, UNLOCK_HOLD_TIMEOUT_MS);
+                }
             } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
-                v.removeCallbacks(mLockUnlockRunnable);
+                if (!fingerprintAvailable) mLockHandler.removeCallbacks(mLockHoldRunnable);
                 v.animate().scaleX(1.0f).scaleY(1.0f).setDuration(150).start();
             }
             return true;
         });
 
-        overlay.addView(lockIcon, new FrameLayout.LayoutParams(
-            Math.round(64 * density), Math.round(64 * density), Gravity.CENTER));
+        mLockContainer = container;
+        overlay.addView(mLockContainer, new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
 
         content.addView(overlay, new FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
         mLockOverlay = overlay;
-        mLockIcon = lockIcon;
         overlay.requestFocus();
 
-        startLockOverlayBurnInProtection(overlay, lockIcon);
+        startLockOverlayBurnInProtection(overlay, mLockContainer);
+    }
+
+    @SuppressWarnings("deprecation")
+    private boolean isFingerprintAvailable() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return false;
+        try {
+            FingerprintManager fingerprintManager = (FingerprintManager) getSystemService(FINGERPRINT_SERVICE);
+            return fingerprintManager != null
+                && fingerprintManager.isHardwareDetected()
+                && fingerprintManager.hasEnrolledFingerprints();
+        } catch (Exception e) {
+            Logger.logError(LOG_TAG, "isFingerprintAvailable: " + e);
+            return false;
+        }
     }
 
     /**
-     * Slowly move the lock icon to random positions so that the statically locked screen does not
-     * burn in on OLED displays.
+     * Starts a dialog-less fingerprint scan. The scan is cancelled after
+     * {@link #FINGERPRINT_TIMEOUT_MS} milliseconds without a successful scan, so that no system UI
+     * stays on screen while the app is locked.
+     */
+    @SuppressWarnings("deprecation")
+    private void startFingerprintAuthentication() {
+        if (!mIsLocked || mFingerprintAuthenticating) return;
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return;
+
+        FingerprintManager fingerprintManager = (FingerprintManager) getSystemService(FINGERPRINT_SERVICE);
+        if (fingerprintManager == null) return;
+
+        mFingerprintAuthenticating = true;
+        setLockHint(R.string.msg_lock_fp_authing);
+        mFingerprintSignal = new CancellationSignal();
+        try {
+            fingerprintManager.authenticate(null, mFingerprintSignal, 0,
+                mFingerprintAuthCallback, new Handler(Looper.getMainLooper()));
+        } catch (SecurityException | IllegalStateException e) {
+            Logger.logError(LOG_TAG, "startFingerprintAuthentication: " + e);
+            finishFingerprintAuthentication();
+            setLockHint(R.string.msg_lock_fp_failed);
+            return;
+        }
+
+        mLockTimeoutRunnable = () -> {
+            if (mFingerprintAuthenticating) {
+                finishFingerprintAuthentication();
+                setLockHint(R.string.msg_lock_fp_timeout);
+            }
+        };
+        mLockHandler.postDelayed(mLockTimeoutRunnable, FINGERPRINT_TIMEOUT_MS);
+    }
+
+    @SuppressWarnings("deprecation")
+    private final FingerprintManager.AuthenticationCallback mFingerprintAuthCallback =
+        new FingerprintManager.AuthenticationCallback() {
+            @Override
+            public void onAuthenticationSucceeded(FingerprintManager.AuthenticationResult result) {
+                if (!mIsLocked) return;
+                finishFingerprintAuthentication();
+                unlockScreen();
+            }
+
+            @Override
+            public void onAuthenticationError(int errorCode, CharSequence errString) {
+                if (!mIsLocked) return;
+                finishFingerprintAuthentication();
+                setLockHint(errorCode == FingerprintManager.FINGERPRINT_ERROR_CANCELED
+                    ? R.string.msg_lock_fp_timeout : R.string.msg_lock_fp_failed);
+            }
+
+            @Override
+            public void onAuthenticationHelp(int helpCode, CharSequence helpString) {
+                // Keep listening; the hint text already tells the user what to do.
+            }
+
+            @Override
+            public void onAuthenticationFailed() {
+                if (!mIsLocked) return;
+                setLockHint(R.string.msg_lock_fp_failed);
+            }
+        };
+
+    private void finishFingerprintAuthentication() {
+        mFingerprintAuthenticating = false;
+        if (mLockTimeoutRunnable != null && mLockHandler != null)
+            mLockHandler.removeCallbacks(mLockTimeoutRunnable);
+        mLockTimeoutRunnable = null;
+        if (mFingerprintSignal != null) {
+            try {
+                mFingerprintSignal.cancel();
+            } catch (Exception ignored) {
+            }
+            mFingerprintSignal = null;
+        }
+        if (mIsLocked) setLockHint(R.string.msg_lock_fp_hint);
+    }
+
+    private void setLockHint(int stringResId) {
+        if (mLockHint != null) mLockHint.setText(stringResId);
+    }
+
+    /**
+     * Slowly move the lock icon + hint container to random positions so that the statically locked
+     * screen does not burn in on OLED displays.
      */
     private void startLockOverlayBurnInProtection(final View overlay, final View lockView) {
         final Random random = new Random();
@@ -769,13 +912,15 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
     private void unlockScreen() {
         if (!mIsLocked) return;
         mIsLocked = false;
+        finishFingerprintAuthentication();
+        if (mLockHandler != null) mLockHandler.removeCallbacksAndMessages(null);
+        mLockHandler = null;
+        mLockHoldRunnable = null;
+        mLockTimeoutRunnable = null;
 
-        if (mLockOverlay != null) {
-            if (mLockMoveRunnable != null) mLockOverlay.removeCallbacks(mLockMoveRunnable);
-            if (mLockIcon != null && mLockUnlockRunnable != null) mLockIcon.removeCallbacks(mLockUnlockRunnable);
-        }
+        if (mLockOverlay != null && mLockMoveRunnable != null)
+            mLockOverlay.removeCallbacks(mLockMoveRunnable);
         mLockMoveRunnable = null;
-        mLockUnlockRunnable = null;
         if (mLockAnimator != null) {
             mLockAnimator.cancel();
             mLockAnimator = null;
@@ -786,7 +931,8 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
             content.removeView(mLockOverlay);
             mLockOverlay = null;
         }
-        mLockIcon = null;
+        mLockContainer = null;
+        mLockHint = null;
         if (mTerminalView != null) mTerminalView.requestFocus();
     }
 
